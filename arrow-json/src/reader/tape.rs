@@ -21,6 +21,7 @@ use memchr::memchr2;
 use serde_core::Serialize;
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::ops::ControlFlow::{self, Break, Continue};
 
 /// We decode JSON to a flattened tape representation,
 /// allowing for efficient traversal of the JSON data
@@ -473,7 +474,7 @@ impl TapeDecoder {
         }
 
         loop {
-            if !self.decode_one::<true>(iter)? {
+            if self.decode_one::<true>(iter)?.is_break() {
                 // Buffer exhausted, still skipping
                 break;
             }
@@ -513,7 +514,7 @@ impl TapeDecoder {
                 dispatch_value!(self, b, no_skip, |s| self.stack.push(s));
             }
 
-            if !self.decode_one::<false>(&mut iter)? {
+            if self.decode_one::<false>(&mut iter)?.is_break() {
                 break; // Buffer exhausted
             }
         }
@@ -526,9 +527,12 @@ impl TapeDecoder {
     /// When SKIP=false, writes to tape as normal.
     /// When SKIP=true, parses JSON structure but omits all tape writes.
     ///
-    /// Returns Ok(true) if a state was processed and more processing may be needed.
-    /// Returns Ok(false) if the buffer was exhausted.
-    fn decode_one<const SKIP: bool>(&mut self, iter: &mut BufIter) -> Result<bool, ArrowError> {
+    /// Returns Ok(Continue(())) if a state was processed and more processing may be needed.
+    /// Returns Ok(Break(())) if the buffer was exhausted.
+    fn decode_one<const SKIP: bool>(
+        &mut self,
+        iter: &mut BufIter,
+    ) -> Result<ControlFlow<()>, ArrowError> {
         // Macro to conditionally execute tape operations
         macro_rules! maybe_skip {
             ($($tt:tt)*) => {
@@ -538,22 +542,22 @@ impl TapeDecoder {
             };
         }
 
-        /// Evaluates to the next element in the iterator or returns Ok(false)
+        /// Evaluates to the next element in the iterator or returns Ok(Break(()))
         macro_rules! next {
             ($next:ident) => {
                 match $next.next() {
                     Some(b) => b,
-                    None => return Ok(false),
+                    None => return Ok(Break(())),
                 }
             };
         }
 
-        /// Evaluates to the next non-whitespace byte in the iterator or returns Ok(false)
+        /// Evaluates to the next non-whitespace byte in the iterator or returns Ok(Break(()))
         macro_rules! next_non_whitespace {
             ($next:ident) => {
                 match $next.next_non_whitespace() {
                     Some(b) => b,
-                    None => return Ok(false),
+                    None => return Ok(Break(())),
                 }
             };
         }
@@ -603,7 +607,7 @@ impl TapeDecoder {
                     b']' => {
                         maybe_skip!(self.end_list(start_idx));
                         self.stack.pop();
-                        return Ok(true);
+                        return Ok(Continue(()));
                     }
                 );
             }
@@ -649,7 +653,7 @@ impl TapeDecoder {
 
                 if iter.is_empty() {
                     // Buffer exhausted, number incomplete
-                    return Ok(false);
+                    return Ok(Break(()));
                 }
 
                 // Hit delimiter, number complete
@@ -689,7 +693,7 @@ impl TapeDecoder {
                 // Loop ended - check if incomplete
                 if *idx < bytes.len() as u8 {
                     // Incomplete - buffer exhausted
-                    return Ok(false);
+                    return Ok(Break(()));
                 }
 
                 // Literal complete
@@ -700,7 +704,7 @@ impl TapeDecoder {
                 let v = match next!(iter) {
                     b'u' => {
                         *state = DecoderState::Unicode(0, 0, 0);
-                        return Ok(true);
+                        return Ok(Continue(()));
                     }
                     b'"' => b'"',
                     b'\\' => b'\\',
@@ -748,7 +752,7 @@ impl TapeDecoder {
             },
         }
 
-        Ok(true)
+        Ok(Continue(()))
     }
 
     /// Writes any type that implements [`Serialize`] into this [`TapeDecoder`]
