@@ -137,6 +137,7 @@ use crate::StructMode;
 use crate::reader::binary_array::{
     BinaryArrayDecoder, BinaryViewDecoder, FixedSizeBinaryArrayDecoder,
 };
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::sync::Arc;
 
@@ -182,6 +183,7 @@ pub struct ReaderBuilder {
     batch_size: usize,
     coerce_primitive: bool,
     strict_mode: bool,
+    projection: bool,
     is_field: bool,
     struct_mode: StructMode,
 
@@ -202,6 +204,7 @@ impl ReaderBuilder {
             batch_size: 1024,
             coerce_primitive: false,
             strict_mode: false,
+            projection: false,
             is_field: false,
             struct_mode: Default::default(),
             schema,
@@ -243,6 +246,7 @@ impl ReaderBuilder {
             batch_size: 1024,
             coerce_primitive: false,
             strict_mode: false,
+            projection: false,
             is_field: true,
             struct_mode: Default::default(),
             schema: Arc::new(Schema::new([field.into()])),
@@ -275,6 +279,19 @@ impl ReaderBuilder {
         }
     }
 
+    /// Enables projection-aware parsing to skip fields not present in the schema.
+    ///
+    /// When enabled, JSON fields that are not present in the schema will be skipped
+    /// during tape parsing rather than being fully parsed and later discarded.
+    /// This can provide significant performance improvements when the JSON contains
+    /// many fields that are not needed.
+    ///
+    /// Note: This is ignored when `strict_mode` is true, which always checks projection
+    /// and returns an error for unknown fields.
+    pub fn with_projection(self, projection: bool) -> Self {
+        Self { projection, ..self }
+    }
+
     /// Set the [`StructMode`] for the reader, which determines whether structs
     /// can be decoded from JSON as objects or lists. For more details refer to
     /// the enum documentation. Default is to use `ObjectOnly`.
@@ -303,6 +320,19 @@ impl ReaderBuilder {
             }
         };
 
+        let num_fields = self.schema.flattened_fields().len();
+
+        // Extract projection field set from schema for projection-aware parsing
+        // - strict_mode: fail-fast on unknown fields during tape parsing
+        // - projection: skip JSON fields not present in the schema
+        let enable_projection = self.strict_mode || self.projection;
+        let projection: Option<HashSet<String>> = match &data_type {
+            DataType::Struct(fields) if enable_projection && !fields.is_empty() => {
+                Some(fields.iter().map(|f| f.name().clone()).collect())
+            }
+            _ => None,
+        };
+
         let decoder = make_decoder(
             data_type,
             self.coerce_primitive,
@@ -311,12 +341,15 @@ impl ReaderBuilder {
             self.struct_mode,
         )?;
 
-        let num_fields = self.schema.flattened_fields().len();
-
         Ok(Decoder {
             decoder,
             is_field: self.is_field,
-            tape_decoder: TapeDecoder::new(self.batch_size, num_fields),
+            tape_decoder: TapeDecoder::new(
+                self.batch_size,
+                num_fields,
+                projection,
+                self.strict_mode,
+            ),
             batch_size: self.batch_size,
             schema: self.schema,
         })

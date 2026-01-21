@@ -19,6 +19,7 @@ use crate::reader::serializer::TapeSerializer;
 use arrow_schema::ArrowError;
 use memchr::memchr2;
 use serde_core::Serialize;
+use std::collections::HashSet;
 use std::fmt::Write;
 
 /// We decode JSON to a flattened tape representation,
@@ -295,34 +296,19 @@ impl Literal {
     }
 }
 
-/// Evaluates to the next element in the iterator or breaks the current loop
-macro_rules! next {
-    ($next:ident) => {
-        match $next.next() {
-            Some(b) => b,
-            None => break,
-        }
-    };
-}
-
-/// Evaluates to the next non-whitespace byte in the iterator or breaks the current loop
-macro_rules! next_non_whitespace {
-    ($next:ident) => {
-        match $next.next_non_whitespace() {
-            Some(b) => b,
-            None => break,
-        }
-    };
+/// No-op wrapper macro for dispatch_value when skip mode is not needed
+macro_rules! no_skip {
+    ($($tt:tt)*) => { $($tt)* };
 }
 
 /// Dispatches value type detection with optional special case and custom transition function
 macro_rules! dispatch_value {
-    ($self:ident, $b:expr, |$s:ident| $transition:expr $(, $special:pat => $special_body:expr)?) => {{
+    ($self:ident, $b:expr, $wrapper:ident, |$s:ident| $transition:expr $(, $special:pat => $special_body:expr)?) => {{
         let $s = match $b {
             $($special => $special_body,)?
             b'"' => DecoderState::String,
             b @ (b'-' | b'0'..=b'9') => {
-                $self.bytes.push(b);
+                $wrapper!($self.bytes.push(b));
                 DecoderState::Number
             }
             b'n' => DecoderState::Literal(Literal::Null, 1),
@@ -330,12 +316,12 @@ macro_rules! dispatch_value {
             b't' => DecoderState::Literal(Literal::True, 1),
             b'[' => {
                 let idx = $self.elements.len() as u32;
-                $self.elements.push(TapeElement::StartList(u32::MAX));
+                $wrapper!($self.elements.push(TapeElement::StartList(u32::MAX)));
                 DecoderState::List(idx)
             }
             b'{' => {
                 let idx = $self.elements.len() as u32;
-                $self.elements.push(TapeElement::StartObject(u32::MAX));
+                $wrapper!($self.elements.push(TapeElement::StartObject(u32::MAX)));
                 DecoderState::Object(idx)
             }
             b => return Err(err(b, "parsing value")),
@@ -365,12 +351,31 @@ pub struct TapeDecoder {
 
     /// A stack of [`DecoderState`]
     stack: Vec<DecoderState>,
+
+    /// Optional projection: set of field names to include at the top level
+    /// If None, all fields are parsed. If Some, only fields in the set are parsed.
+    projection: Option<HashSet<String>>,
+
+    /// If true, return error when encountering fields not in projection
+    strict_mode: bool,
+
+    /// When true, we're skipping a top-level field value (not in projection).
+    /// We return to normal mode when stack.len() <= 1.
+    skipping: bool,
 }
 
 impl TapeDecoder {
     /// Create a new [`TapeDecoder`] with the provided batch size
     /// and an estimated number of fields in each row
-    pub fn new(batch_size: usize, num_fields: usize) -> Self {
+    ///
+    /// If `projection` is Some, only top-level fields in the set will be parsed and written to the tape.
+    /// Other fields will be skipped during parsing (or rejected if `strict_mode` is true).
+    pub fn new(
+        batch_size: usize,
+        num_fields: usize,
+        projection: Option<HashSet<String>>,
+        strict_mode: bool,
+    ) -> Self {
         let tokens_per_row = 2 + num_fields * 2;
         let mut offsets = Vec::with_capacity(batch_size * (num_fields * 2) + 1);
         offsets.push(0);
@@ -385,6 +390,9 @@ impl TapeDecoder {
             cur_row: 0,
             bytes: Vec::with_capacity(num_fields * 2 * 8),
             stack: Vec::with_capacity(10),
+            projection,
+            strict_mode,
+            skipping: false,
         }
     }
 
@@ -393,7 +401,6 @@ impl TapeDecoder {
         let end_idx = self.elements.len() as u32;
         self.elements[start_idx as usize] = TapeElement::StartObject(end_idx);
         self.elements.push(TapeElement::EndObject(start_idx));
-        self.stack.pop();
     }
 
     /// Write the closing elements for a list to the tape
@@ -401,188 +408,347 @@ impl TapeDecoder {
         let end_idx = self.elements.len() as u32;
         self.elements[start_idx as usize] = TapeElement::StartList(end_idx);
         self.elements.push(TapeElement::EndList(start_idx));
-        self.stack.pop();
+    }
+
+    /// Check if the current top-level field should be skipped based on projection.
+    /// If so, removes the field name from the tape and processes the value in skip mode.
+    fn maybe_skip_field(&mut self, iter: &mut BufIter) -> Result<(), ArrowError> {
+        let Some(ref projection) = self.projection else {
+            return Ok(());
+        };
+
+        let Some(TapeElement::String(string_idx)) = self.elements.last() else {
+            return Err(ArrowError::JsonError(
+                "Internal error: expected field name at end of tape".to_string(),
+            ));
+        };
+
+        let string_idx = *string_idx as usize;
+        let start = self.offsets[string_idx];
+        let end = self.offsets[string_idx + 1];
+        let field_name = std::str::from_utf8(&self.bytes[start..end])
+            .map_err(|e| ArrowError::JsonError(format!("Invalid UTF-8 in field name: {e}")))?;
+
+        if !projection.contains(field_name) {
+            if self.strict_mode {
+                // Strict mode: error on unknown field
+                return Err(ArrowError::JsonError(format!(
+                    "column '{field_name}' missing from schema"
+                )));
+            }
+
+            // Field not in projection: skip its value
+            // Remove the field name from tape to maintain structure
+            self.elements.pop();
+            self.bytes.truncate(start);
+            self.offsets.pop();
+
+            // Enter skip mode and process the value
+            // decode_skip will clear skipping flag if it finishes
+            self.skipping = true;
+            self.decode_skip(iter)?;
+        }
+
+        Ok(())
+    }
+
+    /// Decode in skip mode - parse JSON structure but don't write to tape
+    ///
+    /// This thin wrapper calls decode_one::<true> to process states without writing to tape.
+    /// It processes until either the buffer is exhausted or we return to depth 1.
+    /// If we finish (return to depth 1), the skipping flag is cleared.
+    fn decode_skip(&mut self, iter: &mut BufIter) -> Result<(), ArrowError> {
+        // Validate preconditions
+        if !self.skipping {
+            return Err(ArrowError::JsonError(
+                "Internal error: decode_skip called without skipping flag set".to_string(),
+            ));
+        }
+
+        if self.stack.len() <= 1 {
+            return Err(ArrowError::JsonError(format!(
+                "Internal error: decode_skip called with skipping=true but stack.len()={}",
+                self.stack.len()
+            )));
+        }
+
+        loop {
+            if !self.decode_one::<true>(iter)? {
+                // Buffer exhausted, still skipping
+                break;
+            }
+
+            // Check if we finished skipping after processing
+            if self.stack.len() <= 1 {
+                self.skipping = false;
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn decode(&mut self, buf: &[u8]) -> Result<usize, ArrowError> {
         let mut iter = BufIter::new(buf);
 
-        while !iter.is_empty() {
-            let state = match self.stack.last_mut() {
-                Some(l) => l,
-                None => {
-                    if self.cur_row >= self.batch_size {
-                        break;
-                    }
+        // Check if we're resuming skip mode from a previous buffer
+        if self.skipping {
+            self.decode_skip(&mut iter)?;
+        }
 
-                    // Start of row
-                    let b = next_non_whitespace!(iter);
-                    self.cur_row += 1;
+        loop {
+            // Check if we need to start a new row
+            if self.stack.is_empty() {
+                if self.cur_row >= self.batch_size {
+                    break;
+                }
 
-                    // Detect value type and push appropriate state
-                    dispatch_value!(self, b, |s| self.stack.push(s));
+                // Start of row
+                let Some(b) = iter.next_non_whitespace() else {
+                    break;
+                };
+                self.cur_row += 1;
 
-                    self.stack.last_mut().unwrap()
-                }
-            };
+                // Detect value type and push appropriate state
+                dispatch_value!(self, b, no_skip, |s| self.stack.push(s));
+            }
 
-            match state {
-                // Expecting object member or close brace
-                DecoderState::Object(start_idx) => {
-                    let start_idx = *start_idx;
-                    match next_non_whitespace!(iter) {
-                        b'"' => {
-                            *state = DecoderState::ObjectAfterValue(start_idx);
-                            self.stack.push(DecoderState::Colon);
-                            self.stack.push(DecoderState::String);
-                        }
-                        b'}' => self.end_object(start_idx),
-                        b => return Err(err(b, "expected '\"' or '}'")),
-                    }
-                }
-                // After value in object - expecting comma or close brace
-                DecoderState::ObjectAfterValue(start_idx) => {
-                    let start_idx = *start_idx;
-                    match next_non_whitespace!(iter) {
-                        b',' => *state = DecoderState::Object(start_idx),
-                        b'}' => self.end_object(start_idx),
-                        b => return Err(err(b, "expected ',' or '}'")),
-                    }
-                }
-                // Decoding a list - awaiting next element or ']'
-                DecoderState::List(start_idx) => {
-                    let start_idx = *start_idx;
-                    dispatch_value!(
-                        self,
-                        next_non_whitespace!(iter),
-                        |s| {
-                            *state = DecoderState::ListAfterValue(start_idx);
-                            self.stack.push(s);
-                        },
-                        b']' => {
-                            self.end_list(start_idx);
-                            continue;
-                        }
-                    );
-                }
-                // After value in a list - expecting comma or close bracket
-                DecoderState::ListAfterValue(start_idx) => {
-                    let start_idx = *start_idx;
-                    match next_non_whitespace!(iter) {
-                        b',' => *state = DecoderState::List(start_idx),
-                        b']' => self.end_list(start_idx),
-                        b => return Err(err(b, "expected ',' or ']'")),
-                    }
-                }
-                // Decoding a string
-                DecoderState::String => {
-                    let s = iter.skip_chrs(b'\\', b'"');
-                    self.bytes.extend_from_slice(s);
-
-                    match next!(iter) {
-                        b'\\' => self.stack.push(DecoderState::Escape),
-                        b'"' => {
-                            let idx = self.offsets.len() - 1;
-                            self.elements.push(TapeElement::String(idx as _));
-                            self.offsets.push(self.bytes.len());
-                            self.stack.pop();
-                        }
-                        b => unreachable!("{}", b),
-                    }
-                }
-                // Skip whitespace and detect value type
-                DecoderState::Value => {
-                    *state = dispatch_value!(self, next_non_whitespace!(iter), |s| s);
-                }
-                DecoderState::Number => {
-                    let s = iter.advance_until(|b| {
-                        !matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-                    });
-                    self.bytes.extend_from_slice(s);
-
-                    if !iter.is_empty() {
-                        self.stack.pop();
-                        let idx = self.offsets.len() - 1;
-                        self.elements.push(TapeElement::Number(idx as _));
-                        self.offsets.push(self.bytes.len());
-                    }
-                }
-                DecoderState::Colon => {
-                    match next_non_whitespace!(iter) {
-                        b':' => *state = DecoderState::Value,
-                        b => return Err(err(b, "parsing colon")),
-                    };
-                }
-                DecoderState::Literal(literal, idx) => {
-                    let bytes = literal.bytes();
-                    let expected = bytes.iter().skip(*idx as usize).copied();
-                    for (expected, b) in expected.zip(&mut iter) {
-                        match b == expected {
-                            true => *idx += 1,
-                            false => return Err(err(b, "parsing literal")),
-                        }
-                    }
-                    if *idx == bytes.len() as u8 {
-                        let element = literal.element();
-                        self.stack.pop();
-                        self.elements.push(element);
-                    }
-                }
-                DecoderState::Escape => {
-                    let v = match next!(iter) {
-                        b'u' => {
-                            self.stack.pop();
-                            self.stack.push(DecoderState::Unicode(0, 0, 0));
-                            continue;
-                        }
-                        b'"' => b'"',
-                        b'\\' => b'\\',
-                        b'/' => b'/',
-                        b'b' => 8,  // BS
-                        b'f' => 12, // FF
-                        b'n' => b'\n',
-                        b'r' => b'\r',
-                        b't' => b'\t',
-                        b => return Err(err(b, "parsing escape sequence")),
-                    };
-
-                    self.stack.pop();
-                    self.bytes.push(v);
-                }
-                // Parse a unicode escape sequence
-                DecoderState::Unicode(high, low, idx) => loop {
-                    match *idx {
-                        0..=3 => *high = (*high << 4) | parse_hex(next!(iter))? as u16,
-                        4 => {
-                            if let Some(c) = char::from_u32(*high as u32) {
-                                write_char(c, &mut self.bytes);
-                                self.stack.pop();
-                                break;
-                            }
-
-                            match next!(iter) {
-                                b'\\' => {}
-                                b => return Err(err(b, "parsing surrogate pair escape")),
-                            }
-                        }
-                        5 => match next!(iter) {
-                            b'u' => {}
-                            b => return Err(err(b, "parsing surrogate pair unicode")),
-                        },
-                        6..=9 => *low = (*low << 4) | parse_hex(next!(iter))? as u16,
-                        _ => {
-                            let c = char_from_surrogate_pair(*low, *high)?;
-                            write_char(c, &mut self.bytes);
-                            self.stack.pop();
-                            break;
-                        }
-                    }
-                    *idx += 1;
-                },
+            if !self.decode_one::<false>(&mut iter)? {
+                break; // Buffer exhausted
             }
         }
 
         Ok(buf.len() - iter.len())
+    }
+
+    /// Process one state from the decoder stack
+    ///
+    /// When SKIP=false, writes to tape as normal.
+    /// When SKIP=true, parses JSON structure but omits all tape writes.
+    ///
+    /// Returns Ok(true) if a state was processed and more processing may be needed.
+    /// Returns Ok(false) if the buffer was exhausted.
+    fn decode_one<const SKIP: bool>(&mut self, iter: &mut BufIter) -> Result<bool, ArrowError> {
+        // Macro to conditionally execute tape operations
+        macro_rules! maybe_skip {
+            ($($tt:tt)*) => {
+                if !SKIP {
+                    $($tt)*
+                }
+            };
+        }
+
+        /// Evaluates to the next element in the iterator or returns Ok(false)
+        macro_rules! next {
+            ($next:ident) => {
+                match $next.next() {
+                    Some(b) => b,
+                    None => return Ok(false),
+                }
+            };
+        }
+
+        /// Evaluates to the next non-whitespace byte in the iterator or returns Ok(false)
+        macro_rules! next_non_whitespace {
+            ($next:ident) => {
+                match $next.next_non_whitespace() {
+                    Some(b) => b,
+                    None => return Ok(false),
+                }
+            };
+        }
+
+        let state = self.stack.last_mut().unwrap();
+
+        match state {
+            // Expecting object member or close brace
+            DecoderState::Object(start_idx) => {
+                let start_idx = *start_idx;
+                match next_non_whitespace!(iter) {
+                    b'"' => {
+                        *state = DecoderState::ObjectAfterValue(start_idx);
+                        self.stack.push(DecoderState::Colon);
+                        self.stack.push(DecoderState::String);
+                    }
+                    b'}' => {
+                        maybe_skip!(self.end_object(start_idx));
+                        self.stack.pop();
+                    }
+                    b => return Err(err(b, "expected '\"' or '}'")),
+                }
+            }
+            // After value in object - expecting comma or close brace
+            DecoderState::ObjectAfterValue(start_idx) => {
+                let start_idx = *start_idx;
+                match next_non_whitespace!(iter) {
+                    b',' => *state = DecoderState::Object(start_idx),
+                    b'}' => {
+                        maybe_skip!(self.end_object(start_idx));
+                        self.stack.pop();
+                    }
+                    b => return Err(err(b, "expected ',' or '}'")),
+                }
+            }
+            // Decoding a list - awaiting next element or ']'
+            DecoderState::List(start_idx) => {
+                let start_idx = *start_idx;
+                dispatch_value!(
+                    self,
+                    next_non_whitespace!(iter),
+                    maybe_skip,
+                    |s| {
+                        *state = DecoderState::ListAfterValue(start_idx);
+                        self.stack.push(s);
+                    },
+                    b']' => {
+                        maybe_skip!(self.end_list(start_idx));
+                        self.stack.pop();
+                        return Ok(true);
+                    }
+                );
+            }
+            // After value in a list - expecting comma or close bracket
+            DecoderState::ListAfterValue(start_idx) => {
+                let start_idx = *start_idx;
+                match next_non_whitespace!(iter) {
+                    b',' => *state = DecoderState::List(start_idx),
+                    b']' => {
+                        maybe_skip!(self.end_list(start_idx));
+                        self.stack.pop();
+                    }
+                    b => return Err(err(b, "expected ',' or ']'")),
+                }
+            }
+            // Decoding a string
+            DecoderState::String => {
+                let s = iter.skip_chrs(b'\\', b'"');
+                maybe_skip!(self.bytes.extend_from_slice(s));
+
+                match next!(iter) {
+                    b'\\' => self.stack.push(DecoderState::Escape),
+                    b'"' => {
+                        maybe_skip! {
+                            let idx = self.offsets.len() - 1;
+                            self.elements.push(TapeElement::String(idx as _));
+                            self.offsets.push(self.bytes.len());
+                        }
+                        self.stack.pop();
+                    }
+                    b => unreachable!("{}", b),
+                }
+            }
+            // Skip whitespace and detect value type
+            DecoderState::Value => {
+                *state = dispatch_value!(self, next_non_whitespace!(iter), maybe_skip, |s| s);
+            }
+            DecoderState::Number => {
+                let s = iter.advance_until(|b| {
+                    !matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                });
+                maybe_skip!(self.bytes.extend_from_slice(s));
+
+                if iter.is_empty() {
+                    // Buffer exhausted, number incomplete
+                    return Ok(false);
+                }
+
+                // Hit delimiter, number complete
+                self.stack.pop();
+                maybe_skip! {
+                    let idx = self.offsets.len() - 1;
+                    self.elements.push(TapeElement::Number(idx as _));
+                    self.offsets.push(self.bytes.len());
+                }
+            }
+            DecoderState::Colon => {
+                match next_non_whitespace!(iter) {
+                    b':' => {
+                        *state = DecoderState::Value;
+
+                        // Check projection (only at top level: stack depth 2)
+                        maybe_skip! {
+                            if self.stack.len() == 2 {
+                                self.maybe_skip_field(iter)?;
+                            }
+                        }
+                    }
+                    b => return Err(err(b, "parsing colon")),
+                };
+            }
+            DecoderState::Literal(literal, idx) => {
+                let bytes = literal.bytes();
+                let expected = bytes.iter().skip(*idx as usize).copied();
+
+                for (expected, b) in expected.zip(iter) {
+                    match b == expected {
+                        true => *idx += 1,
+                        false => return Err(err(b, "parsing literal")),
+                    }
+                }
+
+                // Loop ended - check if incomplete
+                if *idx < bytes.len() as u8 {
+                    // Incomplete - buffer exhausted
+                    return Ok(false);
+                }
+
+                // Literal complete
+                maybe_skip!(self.elements.push(literal.element()));
+                self.stack.pop();
+            }
+            DecoderState::Escape => {
+                let v = match next!(iter) {
+                    b'u' => {
+                        *state = DecoderState::Unicode(0, 0, 0);
+                        return Ok(true);
+                    }
+                    b'"' => b'"',
+                    b'\\' => b'\\',
+                    b'/' => b'/',
+                    b'b' => 8,  // BS
+                    b'f' => 12, // FF
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b => return Err(err(b, "parsing escape sequence")),
+                };
+
+                self.stack.pop();
+                maybe_skip!(self.bytes.push(v));
+            }
+            // Parse a unicode escape sequence
+            DecoderState::Unicode(high, low, idx) => loop {
+                match *idx {
+                    0..=3 => *high = (*high << 4) | parse_hex(next!(iter))? as u16,
+                    4 => {
+                        if let Some(c) = char::from_u32(*high as u32) {
+                            maybe_skip!(write_char(c, &mut self.bytes));
+                            self.stack.pop();
+                            break;
+                        }
+
+                        match next!(iter) {
+                            b'\\' => {}
+                            b => return Err(err(b, "parsing surrogate pair escape")),
+                        }
+                    }
+                    5 => match next!(iter) {
+                        b'u' => {}
+                        b => return Err(err(b, "parsing surrogate pair unicode")),
+                    },
+                    6..=9 => *low = (*low << 4) | parse_hex(next!(iter))? as u16,
+                    _ => {
+                        let c = char_from_surrogate_pair(*low, *high)?;
+                        maybe_skip!(write_char(c, &mut self.bytes));
+                        self.stack.pop();
+                        break;
+                    }
+                }
+                *idx += 1;
+            },
+        }
+
+        Ok(true)
     }
 
     /// Writes any type that implements [`Serialize`] into this [`TapeDecoder`]
@@ -834,7 +1000,7 @@ mod tests {
 
         {"a": ["", "foo", ["bar", "c"]], "b": {"1": []}, "c": {"2": [1, 2, 3]} }
         "#;
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(a.as_bytes()).unwrap();
         assert!(!decoder.has_partial_row());
         assert_eq!(decoder.num_buffered_rows(), 7);
@@ -944,21 +1110,21 @@ mod tests {
     #[test]
     fn test_invalid() {
         // Test invalid
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let err = decoder.decode(b"hello").unwrap_err().to_string();
         assert_eq!(
             err,
             "Json error: Encountered unexpected 'h' whilst parsing value"
         );
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let err = decoder.decode(b"{\"hello\": }").unwrap_err().to_string();
         assert_eq!(
             err,
             "Json error: Encountered unexpected '}' whilst parsing value"
         );
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let err = decoder
             .decode(b"{\"hello\": [ false, tru ]}")
             .unwrap_err()
@@ -968,7 +1134,7 @@ mod tests {
             "Json error: Encountered unexpected ' ' whilst parsing literal"
         );
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let err = decoder
             .decode(b"{\"hello\": \"\\ud8\"}")
             .unwrap_err()
@@ -979,7 +1145,7 @@ mod tests {
         );
 
         // Missing surrogate pair
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let err = decoder
             .decode(b"{\"hello\": \"\\ud83d\"}")
             .unwrap_err()
@@ -990,40 +1156,40 @@ mod tests {
         );
 
         // Test truncation
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(b"{\"he").unwrap();
         assert!(decoder.has_partial_row());
         assert_eq!(decoder.num_buffered_rows(), 1);
         let err = decoder.finish().unwrap_err().to_string();
         assert_eq!(err, "Json error: Truncated record whilst reading string");
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(b"{\"hello\" : ").unwrap();
         let err = decoder.finish().unwrap_err().to_string();
         assert_eq!(err, "Json error: Truncated record whilst reading value");
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(b"{\"hello\" : [").unwrap();
         let err = decoder.finish().unwrap_err().to_string();
         assert_eq!(err, "Json error: Truncated record whilst reading list");
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(b"{\"hello\" : tru").unwrap();
         let err = decoder.finish().unwrap_err().to_string();
         assert_eq!(err, "Json error: Truncated record whilst reading true");
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(b"{\"hello\" : nu").unwrap();
         let err = decoder.finish().unwrap_err().to_string();
         assert_eq!(err, "Json error: Truncated record whilst reading null");
 
         // Test invalid UTF-8
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(b"{\"hello\" : \"world\xFF\"}").unwrap();
         let err = decoder.finish().unwrap_err().to_string();
         assert_eq!(err, "Json error: Encountered non-UTF-8 data");
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         decoder.decode(b"{\"\xe2\" : \"\x96\xa1\"}").unwrap();
         let err = decoder.finish().unwrap_err().to_string();
         assert_eq!(err, "Json error: Encountered truncated UTF-8 sequence");
@@ -1031,13 +1197,61 @@ mod tests {
 
     #[test]
     fn test_invalid_surrogates() {
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let res = decoder.decode(b"{\"test\": \"\\ud800\\ud801\"}");
         assert!(res.is_err());
 
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let res = decoder.decode(b"{\"test\": \"\\udc00\\udc01\"}");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_projection_skip_complex_nested_tape() {
+        // Test that complex nested structures in skipped fields don't pollute the tape,
+        // while complex structures in projected fields are decoded correctly
+        let json = r#"{
+        "a": 1,
+        "skip": {"nested": [1, 2, {"deep": "value"}], "obj": {"x": [3, 4]}},
+        "b": [10, {"inner": "test"}],
+        "skip2": [{"arr": [5, 6]}],
+        "c": "text"
+        }"#;
+
+        let mut projection = HashSet::new();
+        projection.insert("a".to_string());
+        projection.insert("b".to_string());
+        projection.insert("c".to_string());
+
+        let mut decoder = TapeDecoder::new(16, 4, Some(projection), false);
+        decoder.decode(json.as_bytes()).unwrap();
+        let tape = decoder.finish().unwrap();
+
+        // Verify tape structure contains only projected fields
+        // Expected: StartObject, "a", 1, "b", [10, {"inner": "test"}], "c", "text", EndObject
+        assert_eq!(
+            tape.elements,
+            &[
+                TapeElement::Null,            // 0: Null sentinel
+                TapeElement::StartObject(14), // 1: Start of root object
+                TapeElement::String(0),       // 2: "a"
+                TapeElement::Number(1),       // 3: 1
+                TapeElement::String(2),       // 4: "b"
+                TapeElement::StartList(11),   // 5: Start of array [10, {...}]
+                TapeElement::Number(3),       // 6: 10
+                TapeElement::StartObject(10), // 7: Start of {"inner": "test"}
+                TapeElement::String(4),       // 8: "inner"
+                TapeElement::String(5),       // 9: "test"
+                TapeElement::EndObject(7),    // 10: End of {"inner": "test"}
+                TapeElement::EndList(5),      // 11: End of array
+                TapeElement::String(6),       // 12: "c"
+                TapeElement::String(7),       // 13: "text"
+                TapeElement::EndObject(1),    // 14: End of root object
+            ]
+        );
+
+        // Verify string data contains only projected field names and values
+        assert_eq!(tape.strings, "a1b10innertestctext");
     }
 
     #[test]
@@ -1045,7 +1259,7 @@ mod tests {
         // Verify that valid JSON with proper comma usage still works
 
         // Valid object with commas
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"{"a": 1, "b": 2, "c": 3}"#;
         decoder.decode(json.as_bytes()).unwrap();
         let tape = decoder.finish().unwrap();
@@ -1056,7 +1270,7 @@ mod tests {
         assert!(s.contains("\"c\""));
 
         // Valid list with commas
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"[1, 2, 3, 4]"#;
         decoder.decode(json.as_bytes()).unwrap();
         let tape = decoder.finish().unwrap();
@@ -1068,13 +1282,13 @@ mod tests {
         assert!(s.contains("4"));
 
         // Empty object (no commas needed)
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"{}"#;
         decoder.decode(json.as_bytes()).unwrap();
         decoder.finish().unwrap();
 
         // Empty list (no commas needed)
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"[]"#;
         decoder.decode(json.as_bytes()).unwrap();
         decoder.finish().unwrap();
@@ -1085,31 +1299,31 @@ mod tests {
         // Verify that the parser correctly rejects invalid JSON with extra commas in objects
 
         // Empty with comma - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"{,}"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("expected '\"' or '}'"), "Error was: {}", err);
 
         // Leading comma - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"{, "field": 10}"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("expected '\"' or '}'"), "Error was: {}", err);
 
         // Double comma between fields - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"{"a": 1,, "b": 2}"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("expected '\"' or '}'"), "Error was: {}", err);
 
         // Multiple commas - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"{"a": 1,,,, "b": 2}"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("expected '\"' or '}'"), "Error was: {}", err);
 
         // Trailing comma - intentionally allowed
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"{"a": 1,}"#;
         decoder.decode(json.as_bytes()).unwrap();
         let tape = decoder.finish().unwrap();
@@ -1123,31 +1337,31 @@ mod tests {
         // Verify that the parser correctly rejects invalid JSON with extra commas in lists
 
         // Empty with comma - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"[,]"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("parsing value"), "Error was: {}", err);
 
         // Leading comma - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"[, 1, 2]"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("parsing value"), "Error was: {}", err);
 
         // Double comma between elements - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"[1,, 2, 3]"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("parsing value"), "Error was: {}", err);
 
         // Multiple commas - should reject
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"[1,,,, 2]"#;
         let err = decoder.decode(json.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("parsing value"), "Error was: {}", err);
 
         // Trailing comma - intentionally allowed
-        let mut decoder = TapeDecoder::new(16, 2);
+        let mut decoder = TapeDecoder::new(16, 2, None, false);
         let json = r#"[1, 2,]"#;
         decoder.decode(json.as_bytes()).unwrap();
         let tape = decoder.finish().unwrap();
